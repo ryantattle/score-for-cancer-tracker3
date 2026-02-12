@@ -20,53 +20,58 @@ function formatMoney(n) {
 }
 
 function extractRaised(html, $) {
-  // 1) Strongest signal: "$123,456 RAISED"
-  const raisedPattern = /\$?\s*([\d]{1,3}(?:,[\d]{3})+|\d+)(?:\.\d{2})?\s*RAISED\b/i;
-  const m1 = html.match(raisedPattern);
-  if (m1) {
-    const v = parseMoneyToNumber(m1[1]);
-    if (v && v > 0) return { value: v, method: "regex-dollar-raised" };
+  // 1) Best signal: "$186,576 RAISED" (uppercase tracker label)
+  const strictMatches = [...html.matchAll(/\$?\s*([\d]{1,3}(?:,[\d]{3})+|\d+)(?:\.\d{2})?\s+RAISED\b/g)];
+  if (strictMatches.length) {
+    const vals = strictMatches
+      .map((m) => parseMoneyToNumber(m[1]))
+      .filter((v) => Number.isFinite(v) && v > 0);
+
+    if (vals.length) {
+      const filtered = GOAL ? vals.filter((v) => v <= GOAL) : vals;
+      const pickFrom = filtered.length ? filtered : vals;
+      return { value: Math.max(...pickFrom), method: "strict-uppercase-raised" };
+    }
   }
 
-  // 2) Any element text containing "RAISED", parse money from that same element
-  let candidateValues = [];
-  $(":contains('RAISED'), :contains('Raised'), :contains('raised')").each((_, el) => {
+  // 2) Element-level: any element containing uppercase "RAISED" plus dollar value
+  let elementVals = [];
+  $("*").each((_, el) => {
     const t = $(el).text().replace(/\s+/g, " ").trim();
-    if (!t) return;
-    if (!/raised/i.test(t)) return;
-    const match = t.match(/\$[\d,]+(?:\.\d{2})?/g) || [];
-    for (const mm of match) {
+    if (!t || !t.includes("RAISED")) return; // uppercase only
+    const matches = t.match(/\$[\d,]+(?:\.\d{2})?/g) || [];
+    for (const mm of matches) {
       const v = parseMoneyToNumber(mm);
-      if (v && v > 0) candidateValues.push(v);
+      if (v && v > 0) elementVals.push(v);
     }
   });
 
-  // Avoid picking goal amounts; if we can, choose value <= GOAL and reasonably large
-  if (candidateValues.length) {
-    const filtered = candidateValues.filter((v) => !GOAL || v <= GOAL);
-    const pickFrom = filtered.length ? filtered : candidateValues;
-    const best = Math.max(...pickFrom);
-    if (best > 0) return { value: best, method: "element-containing-raised" };
+  if (elementVals.length) {
+    const filtered = GOAL ? elementVals.filter((v) => v <= GOAL) : elementVals;
+    const pickFrom = filtered.length ? filtered : elementVals;
+    return { value: Math.max(...pickFrom), method: "element-uppercase-raised" };
   }
 
-  // 3) Nearby labeled text fallback: "raised" + money in full page text
-  const bodyText = $("body").text().replace(/\s+/g, " ");
-  const m2 = bodyText.match(/\$[\d,]+(?:\.\d{2})?\s*RAISED\b/i);
-  if (m2) {
-    const v = parseMoneyToNumber(m2[0]);
-    if (v && v > 0) return { value: v, method: "body-raised-token" };
+  // 3) Fallback: if uppercase signal fails, try title/progress context
+  const body = $("body").text().replace(/\s+/g, " ");
+  const nearGoalPattern = new RegExp(
+    String.raw`\$?\s*([\d]{1,3}(?:,[\d]{3})+|\d+)(?:\.\d{2})?\s+(?:RAISED|raised)[\s\S]{0,120}GOAL`,
+    "i"
+  );
+  const mg = body.match(nearGoalPattern);
+  if (mg) {
+    const v = parseMoneyToNumber(mg[1]);
+    if (v && v > 0) return { value: v, method: "raised-near-goal-fallback" };
   }
 
-  // 4) Last fallback: currency values, avoid known GOAL if possible
-  const allMoney = bodyText.match(/\$[\d,]+(?:\.\d{2})?/g) || [];
-  const vals = allMoney.map(parseMoneyToNumber).filter((v) => Number.isFinite(v) && v > 0);
+  // 4) Last resort: choose largest currency value that is not equal to GOAL
+  const allMoney = body.match(/\$[\d,]+(?:\.\d{2})?/g) || [];
+  const vals = allMoney
+    .map(parseMoneyToNumber)
+    .filter((v) => Number.isFinite(v) && v > 0 && v !== GOAL);
 
   if (vals.length) {
-    // Prefer values not equal to GOAL and above a minimum threshold
-    const filtered = vals.filter((v) => v !== GOAL && v >= 1000);
-    const pickFrom = filtered.length ? filtered : vals;
-    const best = Math.max(...pickFrom);
-    return { value: best, method: "fallback-currency-max" };
+    return { value: Math.max(...vals), method: "last-resort-currency-max" };
   }
 
   return null;
@@ -95,7 +100,6 @@ export default async function handler(req, res) {
 
     const html = await resp.text();
     const $ = cheerio.load(html);
-
     const extracted = extractRaised(html, $);
 
     if (!extracted?.value) {
