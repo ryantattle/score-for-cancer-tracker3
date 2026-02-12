@@ -20,49 +20,48 @@ function formatMoney(n) {
 
 export default async function handler(req, res) {
   let browser;
-
   try {
+    const executablePath = await chromium.executablePath();
+
     browser = await playwright.launch({
       args: chromium.args,
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
+      executablePath,
+      headless: true, // <-- IMPORTANT: must be boolean
     });
 
-    const page = await browser.newPage({
-      viewport: { width: 1440, height: 1200 },
-    });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 1200 } });
 
     await page.goto(CAMPAIGN_URL, {
-      waitUntil: "domcontentloaded",
-      timeout: 90000,
+      waitUntil: "networkidle",
+      timeout: 120000,
     });
 
-    // Give client scripts a moment to paint the tracker area
-    await page.waitForTimeout(3000);
+    // Small buffer for late-rendered widgets
+    await page.waitForTimeout(2500);
 
-    // Pull rendered text from the visible page
-    const renderedText = await page.evaluate(() => {
-      return document.body?.innerText || "";
-    });
+    const renderedText = await page.evaluate(() => document.body?.innerText || "");
 
-    // Strictly require "$X RAISED" pattern from rendered text
+    // Only accept the tracker-style phrase: "$X RAISED"
     const matches = [...renderedText.matchAll(/\$?\s*([\d]{1,3}(?:,[\d]{3})+|\d+)(?:\.\d{2})?\s+RAISED\b/gi)];
     const values = matches
       .map((m) => parseMoneyToNumber(m[1]))
       .filter((v) => Number.isFinite(v) && v > 0);
 
-    // Prefer plausible raised amount <= goal
+    // Prefer plausible value <= goal
     const underGoal = values.filter((v) => v <= GOAL);
     const finalVals = underGoal.length ? underGoal : values;
 
     if (!finalVals.length) {
-      throw new Error("Could not find '$X RAISED' in rendered DOM");
+      return res.status(500).json({
+        error: "Could not parse total raised",
+        details: "No '$X RAISED' pattern found in rendered page text",
+      });
     }
 
     const totalRaised = Math.max(...finalVals);
     const progressPct = Number(((totalRaised / GOAL) * 100).toFixed(2));
 
-    const payload = {
+    return res.status(200).json({
       totalRaised,
       totalRaisedDisplay: formatMoney(totalRaised),
       goal: GOAL,
@@ -72,18 +71,13 @@ export default async function handler(req, res) {
       source: CAMPAIGN_URL,
       method: "playwright-rendered-dom",
       stale: false,
-    };
-
-    res.setHeader("Cache-Control", "s-maxage=120, stale-while-revalidate=600");
-    return res.status(200).json(payload);
+    });
   } catch (e) {
     return res.status(500).json({
       error: "Could not parse total raised",
       details: String(e),
     });
   } finally {
-    if (browser) {
-      await browser.close();
-    }
+    if (browser) await browser.close();
   }
 }
